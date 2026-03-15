@@ -8,59 +8,82 @@ class SkillManager:
     def __init__(self):
         self.character_name = CHAR_NONE
         self.cooldown_max = 0
-        self.last_used_time = 0
+        self.last_used_time = -999999  # 【修复】：初始化为一个极小值，确保开局立即可用
         self.is_ready = True
+        self.cooldown_reduction = 0.0 # 0.0 - 1.0 (来自卡牌加成)
 
     def set_character(self, name):
         self.character_name = name
-        self.last_used_time = -999999  # 确保开局可用
+        self.last_used_time = -999999
+        self.cooldown_reduction = 0.0
 
-        if name == CHAR_KEQING:
-            self.cooldown_max = SKILL_COOLDOWN_KEQING
-        elif name == CHAR_GANYU:
-            self.cooldown_max = SKILL_COOLDOWN_GANYU
-        elif name == CHAR_ZHONGLI:
-            self.cooldown_max = SKILL_COOLDOWN_ZHONGLI
-        elif name == CHAR_ZIBAI:
-            self.cooldown_max = SKILL_COOLDOWN_ZIBAI
-        else:
-            self.cooldown_max = 0
+        if name == CHAR_KEQING: self.cooldown_max = SKILL_COOLDOWN_KEQING
+        elif name == CHAR_GANYU: self.cooldown_max = SKILL_COOLDOWN_GANYU
+        elif name == CHAR_ZHONGLI: self.cooldown_max = SKILL_COOLDOWN_ZHONGLI
+        elif name == CHAR_ZIBAI: self.cooldown_max = SKILL_COOLDOWN_ZIBAI
+        else: self.cooldown_max = 0
 
     def reset(self):
-        self.last_used_time = -self.cooldown_max
+        self.last_used_time = -999999
+        self.cooldown_reduction = 0.0
+
+    def adjust_time(self, delta_ms):
+        """修复暂停BUG：将上次使用时间向后推移，保持剩余CD不变"""
+        self.last_used_time += delta_ms
+
+    def get_effective_cooldown(self):
+        return self.cooldown_max * (1.0 - self.cooldown_reduction)
 
     def update(self, current_time):
         if self.character_name == CHAR_NONE:
             self.is_ready = False
             return
         elapsed = current_time - self.last_used_time
-        self.is_ready = (elapsed >= self.cooldown_max)
+        self.is_ready = (elapsed >= self.get_effective_cooldown())
 
     def get_cooldown_progress(self, current_time):
         if self.character_name == CHAR_NONE: return 0.0
         elapsed = current_time - self.last_used_time
-        if elapsed >= self.cooldown_max: return 1.0
-        return elapsed / self.cooldown_max
+        cd = self.get_effective_cooldown()
+        if elapsed >= cd: return 1.0
+        return elapsed / cd
 
     def get_remaining_seconds(self, current_time):
         elapsed = current_time - self.last_used_time
-        remain = self.cooldown_max - elapsed
+        cd = self.get_effective_cooldown()
+        remain = cd - elapsed
         if remain < 0: return 0
         return int(remain / 1000)
 
     def try_trigger(self, game_instance):
         current_time = pygame.time.get_ticks()
+        
+        # 【修复】：如果技能还没冷却好，直接拒绝，不再执行错误判定
         if not self.is_ready:
             return False
+        
+        # 荒星破顶判定 (0305): 超过顶部使用技能判负
+        if "0305" in game_instance.owned_cards:
+            for x in range(GRID_WIDTH):
+                if game_instance.grid[0][x]:
+                    game_instance.game_over_flag = True
+                    return False
 
         success = False
-        if self.character_name == CHAR_KEQING:
+        trigger_char = self.character_name
+        
+        # 【修复】：处理 "0302" 随机效果，正确读取 owned_cards
+        if "0302" in game_instance.owned_cards:
+             pool = [CHAR_KEQING, CHAR_GANYU, CHAR_ZHONGLI, CHAR_ZIBAI] 
+             trigger_char = random.choice(pool)
+
+        if trigger_char == CHAR_KEQING:
             success = self._trigger_keqing(game_instance)
-        elif self.character_name == CHAR_GANYU:
+        elif trigger_char == CHAR_GANYU:
             success = self._trigger_ganyu(game_instance)
-        elif self.character_name == CHAR_ZHONGLI:
+        elif trigger_char == CHAR_ZHONGLI:
             success = self._trigger_zhongli(game_instance)
-        elif self.character_name == CHAR_ZIBAI:
+        elif trigger_char == CHAR_ZIBAI:
             success = self._trigger_zibai(game_instance)
 
         if success:
@@ -70,16 +93,13 @@ class SkillManager:
         return False
 
     # --- 技能具体实现 ---
-
     def _trigger_keqing(self, game):
-        """刻晴：标记两个方块"""
         candidates = []
         for y in range(GRID_HEIGHT):
             for x in range(GRID_WIDTH):
                 block = game.grid[y][x]
                 if block and block != "stone" and block != "bloom" and not game.marks[y][x]:
                     candidates.append((y, x))
-
         if not candidates: return False
         count = min(len(candidates), 2)
         targets = random.sample(candidates, count)
@@ -87,16 +107,11 @@ class SkillManager:
         return True
 
     def _trigger_ganyu(self, game):
-        """甘雨：接下来5组方块为同色"""
-        # 激活Buff
         game.ganyu_buff_charges = 5
-        # 立即刷新当前的 NEXT 预览（可选，为了视觉反馈更好，重新生成next）
         game.next_blocks_data = game.generate_random_pair()
         return True
 
     def _trigger_zhongli(self, game):
-        """钟离：召唤天星"""
-        # 找到最高的方块行
         top_y = GRID_HEIGHT
         for y in range(GRID_HEIGHT):
             for x in range(GRID_WIDTH):
@@ -104,18 +119,12 @@ class SkillManager:
                     top_y = y
                     break
             if top_y != GRID_HEIGHT: break
-
-        # 即使棋盘是空的，也可以砸最下面
         if top_y == GRID_HEIGHT: top_y = GRID_HEIGHT - 1
-
-        # 在游戏中生成陨石对象
         game.spawn_meteor(top_y)
         return True
 
     def _trigger_zibai(self, game):
-        """兹白：每3秒抛入一只结晶马，共抛3次"""
         current_now = pygame.time.get_ticks()
-        # 将3个生成事件加入队列：现在，+3秒，+6秒
         game.zibai_summon_queue.append(current_now + 0)
         game.zibai_summon_queue.append(current_now + 3000)
         game.zibai_summon_queue.append(current_now + 6000)
